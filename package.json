@@ -1,0 +1,57 @@
+{
+  "name": "ai-workspace-prototype",
+  "private": true,
+  "version": "0.1.5",
+  "type": "module",
+  "main": "electron/main.mjs",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5180 --strictPort",
+    "build": "tsc --noEmit && vite build && node electron/make-relative-assets.mjs",
+    "test": "node --test test/*.test.mjs",
+    "preview": "vite preview",
+    "electron": "electron .",
+    "desktop": "concurrently -k \"npm run dev\" \"wait-on http://127.0.0.1:5180 && set VITE_DEV_SERVER_URL=http://127.0.0.1:5180&& npm run electron\"",
+    "desktop:production": "npm run build && npm run electron",
+    "package:win": "npm run build && electron-builder --win portable"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "4.7.0",
+    "@vitejs/plugin-react": "4.3.3",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-markdown": "9.0.1",
+    "remark-gfm": "4.0.0",
+    "typescript": "5.6.3",
+    "vite": "5.4.10"
+  },
+  "build": {
+    "appId": "com.workmate.aistudio",
+    "productName": "Workmate AI 工作区",
+    "directories": {
+      "output": "release-latest"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "Workmate-AI-Workspace-${version}-portable.exe"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "20.19.43",
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "concurrently": "9.1.2",
+    "electron": "33.0.2",
+    "electron-builder": "25.1.8",
+    "wait-on": "8.0.1"
+  }
+}
