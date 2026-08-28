@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process'
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { searchQuery, verificationScript, withinRoot } from './security.mjs'
+import { requirePlanBeforeMutation, searchQuery, verificationScript, withinRoot } from './security.mjs'
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'workmate', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }])
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -19,6 +19,7 @@ const maxSearchResults = 50
 const maxSearchOutputBytes = 120 * 1024
 const maxGitOutputBytes = 48 * 1024
 const allowedVerificationScripts = new Set(['build', 'test', 'lint'])
+const activeAiTasks = new Map()
 let workspaceRoot = null
 const configPath = () => path.join(app.getPath('userData'), 'settings.json')
 const defaults = { model: 'deepseek-chat', autoWrite: true, confirmBeforeWrite: false, allowWorkspaceCommands: false, apiKey: '', doubaoSearchKey: '' }
@@ -205,8 +206,9 @@ async function confirmWrite(event, filePath, before, after, exists) {
   const result = await dialog.showMessageBox(window ?? undefined, { type: 'question', buttons: ['允许写入', '拒绝'], defaultId: 0, cancelId: 1, title: '允许 AI 写入文件？', message: relativePath, detail: buildWritePreview(before, after, exists), noLink: true })
   return result.response === 0
 }
-async function runVerificationScript(script, reportProgress) {
+async function runVerificationScript(script, reportProgress, signal) {
   verificationScript(script, allowedVerificationScripts)
+  if (signal?.aborted) throw new Error('任务已取消')
   const packagePath = path.join(workspaceRoot, 'package.json')
   let packageJson
   try { packageJson = JSON.parse(await readFile(packagePath, 'utf8')) } catch { throw new Error('当前工作区缺少可读取的 package.json') }
@@ -216,18 +218,25 @@ async function runVerificationScript(script, reportProgress) {
   return new Promise((resolve, reject) => {
     let output = ''
     let outputTruncated = false
+    let settled = false
+    const settle = (callback, value) => { if (!settled) { settled = true; clearTimeout(timeout); signal?.removeEventListener('abort', abort); callback(value) } }
     const appendOutput = chunk => { const text = String(chunk); const remaining = maxVerificationOutputBytes - Buffer.byteLength(output, 'utf8'); if (remaining <= 0) { outputTruncated = true; return }; const clipped = Buffer.from(text, 'utf8').subarray(0, remaining).toString('utf8'); output += clipped; if (Buffer.byteLength(clipped, 'utf8') < Buffer.byteLength(text, 'utf8')) outputTruncated = true }
     const child = spawn(npmCommand, ['run', script], { cwd: workspaceRoot, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    const timeout = setTimeout(() => { child.kill(); reject(new Error(`npm run ${script} 超过 ${verificationTimeoutMs / 1000} 秒已停止\n${output}`.trim())) }, verificationTimeoutMs)
+    const abort = () => { child.kill(); settle(reject, new Error('任务已取消')) }
+    const timeout = setTimeout(() => { child.kill(); settle(reject, new Error(`npm run ${script} 超过 ${verificationTimeoutMs / 1000} 秒已停止\n${output}`.trim())) }, verificationTimeoutMs)
+    signal?.addEventListener('abort', abort, { once: true })
+    if (signal?.aborted) abort()
     child.stdout.on('data', appendOutput)
     child.stderr.on('data', appendOutput)
-    child.on('error', error => { clearTimeout(timeout); reject(new Error(`无法启动 npm run ${script}：${error.message}`)) })
-    child.on('close', code => { clearTimeout(timeout); const summary = `${output}${outputTruncated ? '\n[输出已截断]' : ''}`.trim(); if (code === 0) resolve(JSON.stringify({ success: true, script, output: summary || '命令已成功完成' })); else reject(new Error(`npm run ${script} 失败（退出码 ${code ?? '未知'}）\n${summary}`.trim())) })
+    child.on('error', error => settle(reject, new Error(`无法启动 npm run ${script}：${error.message}`)))
+    child.on('close', code => { const summary = `${output}${outputTruncated ? '\n[输出已截断]' : ''}`.trim(); if (signal?.aborted) settle(reject, new Error('任务已取消')); else if (code === 0) settle(resolve, JSON.stringify({ success: true, script, output: summary || '命令已成功完成' })); else settle(reject, new Error(`npm run ${script} 失败（退出码 ${code ?? '未知'}）\n${summary}`.trim())) })
   })
 }
-async function executeTool(event, name, args, autoWrite, confirmBeforeWrite, allowWorkspaceCommands, writes, standalone, reportProgress = () => {}, emitActivity = () => {}) {
+async function executeTool(event, name, args, autoWrite, confirmBeforeWrite, allowWorkspaceCommands, writes, standalone, planSubmitted = false, signal, reportProgress = () => {}, emitActivity = () => {}) {
+  if (signal?.aborted) throw new Error('任务已取消')
   if (standalone && name !== 'web_search') throw new Error('独立会话不允许访问本地工作区')
   if (!standalone && name === 'web_search') throw new Error('项目会话不允许联网搜索')
+  if (!standalone) requirePlanBeforeMutation(name, planSubmitted)
   if (name === 'submit_plan') {
     const steps = normalizePlanSteps(args.steps)
     steps.forEach((step, index) => emitActivity({ id: `plan-${index}`, title: step.title, detail: step.detail, status: 'pending', kind: 'plan' }))
@@ -240,7 +249,7 @@ async function executeTool(event, name, args, autoWrite, confirmBeforeWrite, all
     const query = typeof args.query === 'string' ? args.query.trim().slice(0, 100) : ''
     if (!query) throw new Error('搜索关键词不能为空')
     const maxResults = Math.min(Math.max(Number(args.max_results) || 10, 1), 20)
-    const response = await net.fetch('https://open.feedcoopapi.com/search_api/global_search', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body: JSON.stringify({ Query: query, SearchType: 'web', DocCount: maxResults, MaxSnippetLength: 1000 }) })
+    const response = await net.fetch('https://open.feedcoopapi.com/search_api/global_search', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body: JSON.stringify({ Query: query, SearchType: 'web', DocCount: maxResults, MaxSnippetLength: 1000 }), signal })
     const data = await response.json()
     const metadataError = data?.ResponseMetadata?.Error
     const result = data?.Result
@@ -269,7 +278,7 @@ async function executeTool(event, name, args, autoWrite, confirmBeforeWrite, all
   if (name === 'run_verification') {
     if (!allowWorkspaceCommands) throw new Error('AI 运行验证命令已在设置中关闭')
     const script = typeof args.script === 'string' ? args.script : ''
-    return await runVerificationScript(script, reportProgress)
+    return await runVerificationScript(script, reportProgress, signal)
   }
   if (name === 'create_directory') {
     reportProgress('正在创建项目目录…')
@@ -335,6 +344,10 @@ async function readDeepSeekStream(response, onText) {
 async function callDeepSeek(event, input) {
   const standalone = input?.sessionType === 'standalone'
   const sessionKey = typeof input?.sessionKey === 'string' ? input.sessionKey.slice(0, 160) : ''
+  if (sessionKey && activeAiTasks.has(sessionKey)) throw new Error('当前会话已有任务正在执行')
+  const controller = new AbortController()
+  if (sessionKey) activeAiTasks.set(sessionKey, controller)
+  const signal = controller.signal
   const reportProgress = message => { if (sessionKey && !event.sender.isDestroyed()) event.sender.send('ai:progress', { sessionKey, message }) }
   const emitActivity = activity => { if (sessionKey && !event.sender.isDestroyed()) event.sender.send('ai:activity', { sessionKey, ...activity }) }
   const emitText = content => { if (sessionKey && !event.sender.isDestroyed()) event.sender.send('ai:stream', { sessionKey, content }) }
@@ -357,12 +370,13 @@ async function callDeepSeek(event, input) {
     emitActivity({ id: `plan-${index}`, title: planStep.title, detail: detail ?? planStep.detail, status, kind: 'plan' })
   }
   for (let step = 0; step < maxToolIterations; step += 1) {
+    if (signal.aborted) throw new Error('任务已取消')
     const modelActivityId = `model-${step}`
     emitActivity({ id: modelActivityId, title: step === 0 ? '分析任务' : '整理工具结果', detail: step === 0 ? '正在判断完成任务需要的操作' : '正在结合已获得的信息继续处理', status: 'running' })
     reportProgress(step === 0 ? '正在请求 DeepSeek 分析任务…' : '正在根据检索结果整理回答…')
     const body = { model: settings.model, messages: conversation, temperature: 0.2, stream: true }
     if (standalone) { body.tools = tools.filter(tool => tool.function.name === 'web_search'); body.tool_choice = 'auto' } else { body.tools = tools.filter(tool => tool.function.name !== 'web_search' && (settings.allowWorkspaceCommands === true || tool.function.name !== 'run_verification')); body.tool_choice = 'auto' }
-    const response = await net.fetch('https://api.deepseek.com/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body: JSON.stringify(body) })
+    const response = await net.fetch('https://api.deepseek.com/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body: JSON.stringify(body), signal })
     if (!response.ok) { const data = await response.json(); throw new Error(data?.error?.message || `DeepSeek 请求失败（${response.status}）`) }
     const message = await readDeepSeekStream(response, emitText)
     usage = message.usage ?? usage
@@ -383,7 +397,7 @@ async function callDeepSeek(event, input) {
         const target = typeof args.path === 'string' && workspaceRoot ? path.relative(workspaceRoot, withinWorkspace(args.path)) : ''
         const detail = target ? `目标：${target}` : call.function.name === 'submit_plan' ? '正在整理任务步骤' : call.function.name === 'web_search' ? '正在查询互联网公开信息' : call.function.name === 'search_workspace' ? `关键词：${args.query ?? ''}` : call.function.name === 'git_status' ? '正在读取工作区状态' : call.function.name === 'git_diff' ? '正在读取未暂存变更' : call.function.name === 'run_verification' ? `正在运行 npm run ${args.script ?? ''}` : '正在执行项目操作'
         emitActivity({ id: toolId, title: toolTitle, detail, status: 'running' })
-        result = await executeTool(event, call.function.name, args, settings.autoWrite, settings.confirmBeforeWrite === true, settings.allowWorkspaceCommands === true, writes, standalone, reportProgress, emitActivity)
+        result = await executeTool(event, call.function.name, args, settings.autoWrite, settings.confirmBeforeWrite === true, settings.allowWorkspaceCommands === true, writes, standalone, planSteps.length > 0, signal, reportProgress, emitActivity)
         if (isPlanSubmission) { planSteps = normalizePlanSteps(args.steps); activePlanStep = 0 } else if (planSteps[activePlanStep]) { emitPlanStatus(activePlanStep, 'done', '已完成'); activePlanStep += 1 }
         const doneDetail = call.function.name === 'submit_plan' ? '已显示任务计划' : call.function.name === 'web_search' ? '已获取搜索结果，交给模型整理' : call.function.name === 'search_workspace' ? '已获得工作区匹配项' : call.function.name === 'git_status' ? '已获得 Git 状态' : call.function.name === 'git_diff' ? '已获得 Git 差异' : call.function.name === 'run_verification' ? `npm run ${args.script ?? ''} 已通过` : target ? `已完成：${target}` : '已完成'
         emitActivity({ id: toolId, title: toolTitle, detail: doneDetail, status: 'done' })
@@ -415,7 +429,8 @@ ipcMain.handle('workspace:git-status', () => gitStatus())
 ipcMain.handle('workspace:git-diff', (_, filePath) => gitDiff(filePath))
 ipcMain.handle('ai:settings-status', settingsStatus)
 ipcMain.handle('ai:save-settings', saveAiSettings)
-ipcMain.handle('ai:chat', callDeepSeek)
+ipcMain.handle('ai:chat', (event, input) => callDeepSeek(event, input).finally(() => { const sessionKey = typeof input?.sessionKey === 'string' ? input.sessionKey.slice(0, 160) : ''; if (sessionKey) activeAiTasks.delete(sessionKey) }))
+ipcMain.handle('ai:cancel', (_, sessionKey) => { const key = typeof sessionKey === 'string' ? sessionKey.slice(0, 160) : ''; const task = activeAiTasks.get(key); if (!task) return false; task.abort(); return true })
 app.whenReady().then(async () => {
   protocol.handle('workmate', request => { const url = new URL(request.url); const requestPath = decodeURIComponent(url.pathname === '/' ? '/index.html' : url.pathname); const filePath = path.resolve(rendererRoot, `.${requestPath}`); const relative = path.relative(rendererRoot, filePath); return relative.startsWith('..') || path.isAbsolute(relative) ? new Response('Not found', { status: 404 }) : net.fetch(pathToFileURL(filePath).toString()) })
   Menu.setApplicationMenu(null); createWindow(); app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow() })

@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('ai', {
   status: () => ipcRenderer.invoke('ai:settings-status'),
   saveSettings: (settings) => ipcRenderer.invoke('ai:save-settings', settings),
   chat: (messages, sessionType = 'project', sessionKey = '') => ipcRenderer.invoke('ai:chat', { messages, sessionType, sessionKey }),
+  cancel: (sessionKey) => ipcRenderer.invoke('ai:cancel', sessionKey),
 })
 contextBridge.exposeInMainWorld('aiProgress', {
   onProgress: (callback) => {

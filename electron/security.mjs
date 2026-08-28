@@ -18,3 +18,9 @@ export function verificationScript(input, allowed) {
   if (!allowed.has(script)) throw new Error('仅允许运行 npm run build、npm run test 或 npm run lint')
   return script
 }
+
+export function requirePlanBeforeMutation(toolName, planSubmitted) {
+  if (new Set(['write_file', 'create_directory', 'run_verification']).has(toolName) && !planSubmitted) {
+    throw new Error('执行写入、创建目录或验证前必须先提交任务计划')
+  }
+}

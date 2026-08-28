@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import path from 'node:path'
 import test from 'node:test'
-import { searchQuery, verificationScript, withinRoot } from '../electron/security.mjs'
+import { requirePlanBeforeMutation, searchQuery, verificationScript, withinRoot } from '../electron/security.mjs'
 
 const root = path.resolve('fixture-workspace')
 
@@ -23,4 +23,13 @@ test('verificationScript only accepts the static whitelist', () => {
   const allowed = new Set(['build', 'test', 'lint'])
   assert.equal(verificationScript('build', allowed), 'build')
   assert.throws(() => verificationScript('install', allowed), /仅允许/)
+})
+
+test('mutating tools require a submitted plan', () => {
+  for (const tool of ['write_file', 'create_directory', 'run_verification']) {
+    assert.throws(() => requirePlanBeforeMutation(tool, false), /必须先提交任务计划/)
+    assert.doesNotThrow(() => requirePlanBeforeMutation(tool, true))
+  }
+  assert.doesNotThrow(() => requirePlanBeforeMutation('read_file', false))
+  assert.doesNotThrow(() => requirePlanBeforeMutation('search_workspace', false))
 })
